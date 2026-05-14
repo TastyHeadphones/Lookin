@@ -1,0 +1,3 @@
+[submodule "Vendor/LookinServer"]
+	path = Vendor/LookinServer
+	url = https://github.com/QMUI/LookinServer.git

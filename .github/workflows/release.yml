@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: 'Notarize the signed app'
+        required: true
+        type: boolean
+        default: false
+      draft_release:
+        description: 'Attach artifact to a draft GitHub Release'
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, sign, and package
+    runs-on: macos-14
+    env:
+      SCHEME: LookinClient
+      APP_NAME: Lookin
+      BUILD_DIR: ${{ github.workspace }}/build
+      ARCHIVE_PATH: ${{ github.workspace }}/build/Lookin.xcarchive
+      EXPORT_PATH: ${{ github.workspace }}/build/export
+      KEYCHAIN_PATH: ${{ runner.temp }}/lookin-build.keychain-db
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"
+          else
+            V=$(date -u +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V"
+
+      - name: Verify signing secrets are present
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEY_PW: ${{ secrets.KEYCHAIN_PASSWORD }}
+          TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          missing=()
+          [ -n "$CERT_B64" ] || missing+=("MACOS_CERTIFICATE_BASE64")
+          [ -n "$CERT_PW" ]  || missing+=("MACOS_CERTIFICATE_PASSWORD")
+          [ -n "$KEY_PW" ]   || missing+=("KEYCHAIN_PASSWORD")
+          [ -n "$TEAM" ]     || missing+=("DEVELOPMENT_TEAM")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Signed-release secrets missing: ${missing[*]}"
+            echo "::error::Set these in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Install CocoaPods
+        run: gem install cocoapods --no-document
+
+      - name: pod install
+        run: pod install --repo-update
+
+      - name: Import signing certificate
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEY_PW: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="${RUNNER_TEMP}/cert.p12"
+          echo -n "$CERT_B64" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KEY_PW" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEY_PW" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CERT_PW" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEY_PW" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          rm -f "$CERT_PATH"
+          echo "Imported signing identities:"
+          security find-identity -p codesigning -v "$KEYCHAIN_PATH"
+
+      - name: Write ExportOptions.plist
+        env:
+          TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          mkdir -p "$BUILD_DIR"
+          cat > "$BUILD_DIR/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>         <string>developer-id</string>
+            <key>teamID</key>         <string>${TEAM}</string>
+            <key>signingStyle</key>   <string>manual</string>
+            <key>destination</key>    <string>export</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -workspace Lookin.xcworkspace \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -derivedDataPath "$BUILD_DIR/dd" \
+            DEVELOPMENT_TEAM="${{ secrets.DEVELOPMENT_TEAM }}" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
+            | xcbeautify --renderer github-actions
+
+      - name: Export archive
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist "$BUILD_DIR/ExportOptions.plist" \
+            -exportPath "$EXPORT_PATH" \
+            | xcbeautify --renderer github-actions
+
+      - name: Notarize and staple
+        if: ${{ github.event.inputs.notarize == 'true' || startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PW: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_PW" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::error::Notarization requested but APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID secrets are not all set."
+            exit 1
+          fi
+          APP_PATH="$EXPORT_PATH/$APP_NAME.app"
+          NOTARIZE_ZIP="$BUILD_DIR/$APP_NAME-notarize.zip"
+          /usr/bin/ditto -c -k --keepParent "$APP_PATH" "$NOTARIZE_ZIP"
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PW" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          rm -f "$NOTARIZE_ZIP"
+
+      - name: Package zip
+        id: package
+        run: |
+          set -euo pipefail
+          V="${{ steps.version.outputs.version }}"
+          ARTIFACT="$BUILD_DIR/Lookin-$V.zip"
+          /usr/bin/ditto -c -k --keepParent "$EXPORT_PATH/$APP_NAME.app" "$ARTIFACT"
+          SHA=$(shasum -a 256 "$ARTIFACT" | awk '{print $1}')
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"        >> "$GITHUB_OUTPUT"
+          echo "Artifact: $ARTIFACT"
+          echo "sha256:   $SHA"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lookin-${{ steps.version.outputs.version }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.draft_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          files: ${{ steps.package.outputs.artifact }}
+          body: |
+            Lookin ${{ steps.version.outputs.version }}
+
+            **sha256:** `${{ steps.package.outputs.sha256 }}`
+
+            Update the Homebrew Cask with the version and sha256 above —
+            see `Docs/release.md` for the checklist.
